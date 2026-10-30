@@ -1,0 +1,115 @@
+import json, os, uuid
+from datetime import datetime, timezone, timedelta
+
+BASE = "/opt/msp-ai"
+CONTACTS_FILE = f"{BASE}/call_contacts.json"
+HISTORY_FILE = f"{BASE}/call_history.jsonl"
+CALL_MODE = os.getenv("CALL_MODE", "simulation")
+COOLDOWN_MINUTES = 60
+
+
+def _norm(v):
+    return str(v or "").strip().lower()
+
+
+def _mask(phone):
+    p = str(phone or "")
+    return "*" * max(len(p) - 4, 0) + p[-4:]
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _load_history():
+    rows = []
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+    return rows
+
+
+def _save(rec):
+    with open(HISTORY_FILE, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    os.chmod(HISTORY_FILE, 0o600)
+
+
+def _find_contact(customer):
+    try:
+        with open(CONTACTS_FILE) as f:
+            c = json.load(f).get(_norm(customer))
+    except (OSError, ValueError):
+        return None
+    return c if c and c.get("authorized") is True and c.get("phone") else None
+
+
+def _is_duplicate(ticket_id, customer, machine):
+    cutoff = _now() - timedelta(minutes=COOLDOWN_MINUTES)
+    for r in _load_history():
+        if not r.get("attempted"):
+            continue
+        if r.get("ticket_id") == ticket_id:
+            return True
+        if (_norm(r.get("customer")) == _norm(customer)
+                and _norm(r.get("machine")) == _norm(machine)
+                and datetime.fromisoformat(r["time"]) > cutoff):
+            return True
+    return False
+
+
+def place_escalation_call(ticket_id, ticket_number, customer, site, machine,
+                          reason, sim_reply="ACK"):
+    rec = {
+        "call_id": uuid.uuid4().hex[:12],
+        "time": _now().isoformat(timespec="seconds"),
+        "ticket_id": ticket_id,
+        "ticket_number": ticket_number,
+        "customer": customer,
+        "site": site,
+        "machine": machine,
+        "mode": CALL_MODE,
+        "attempted": False,
+        "status": "",
+        "contact": "",
+        "phone": "",
+        "response": "",
+    }
+    contact = _find_contact(customer)
+    if not contact:
+        rec["status"] = "BLOCKED_NO_AUTHORIZED_CONTACT"
+    elif _is_duplicate(ticket_id, customer, machine):
+        rec["status"] = "BLOCKED_DUPLICATE"
+    elif CALL_MODE != "simulation":
+        rec["status"] = "BLOCKED_REAL_CALLS_NOT_ENABLED"
+    else:
+        rec["attempted"] = True
+        rec["contact"] = contact.get("contact_name", "")
+        rec["phone"] = _mask(contact["phone"])
+        rec["status"] = "SIMULATED_COMPLETED"
+        rec["response"] = sim_reply
+        rec["script"] = (
+            f"This is an automated NOC assistant. Server {machine} at {site} "
+            f"is offline. Reason: {reason}. Reply 1 if aware, 2 for engineer callback."
+        )
+    _save(rec)
+    return rec
+
+
+def format_ticket_note(rec):
+    return (
+        "AI NOC call record\n"
+        f"Call ID : {rec['call_id']}\n"
+        f"Time    : {rec['time']}\n"
+        f"Mode    : {rec['mode']}\n"
+        f"Status  : {rec['status']}\n"
+        f"Contact : {rec['contact'] or 'n/a'} {rec['phone']}\n"
+        f"Response: {rec['response'] or 'n/a'}\n"
+        f"Ticket  : #{rec['ticket_number']}"
+    )

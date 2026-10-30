@@ -1,0 +1,8 @@
+{
+  "demo-customer": {
+    "contact_name": "Test Contact",
+    "phone": "+910000000000",
+    "role": "IT Manager",
+    "authorized": true
+  }
+}
